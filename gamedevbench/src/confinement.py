@@ -252,8 +252,10 @@ def _safe_environment() -> Dict[str, str]:
             "http_proxy": f"http://127.0.0.1:{PROXY_PORT}",
             "https_proxy": f"http://127.0.0.1:{PROXY_PORT}",
             "all_proxy": f"http://127.0.0.1:{PROXY_PORT}",
-            "NO_PROXY": "",
-            "no_proxy": "",
+            # Loopback services live inside the private network namespace.
+            # HTTPX and reqwest expect the IPv6 address without URL brackets.
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+            "no_proxy": "localhost,127.0.0.1,::1",
         }
     )
     return environment
@@ -370,6 +372,11 @@ def build_bwrap_command(
             f"Configured Godot executable is unavailable: {godot_path}"
         )
 
+    # The private /etc has no host resolver data. Keep localhost resolvable
+    # without exposing host aliases or adding DNS access to the namespace.
+    hosts_path = proxy_dir / "hosts"
+    hosts_path.write_text("127.0.0.1 localhost\n::1 localhost\n", encoding="utf-8")
+
     command = [
         binary,
         "--unshare-all",
@@ -443,6 +450,7 @@ def build_bwrap_command(
     ]
 
     _add_filtered_etc_mounts(command)
+    command.extend(["--ro-bind", str(hosts_path), "/etc/hosts"])
 
     _add_bind(command, "--ro-bind", package_root, str(package_root))
     _add_bind(command, "--ro-bind", virtualenv, str(virtualenv))

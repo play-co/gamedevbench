@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import platform
@@ -5,23 +6,315 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 
-from gamedevbench.src import benchmark_runner
+from gamedevbench.src import benchmark_runner, confinement, provider_proxy
 from gamedevbench.src.benchmark_runner import GodotBenchmarkRunner
-from gamedevbench.src.confinement import ConfinementError
-from gamedevbench.src.confinement import _safe_environment
-from gamedevbench.src.confinement import _secret_environment
-from gamedevbench.src.confinement import build_bwrap_command
-from gamedevbench.src.confinement import provider_hosts_for
-from gamedevbench.src.confinement import run_confined_godot
-from gamedevbench.src.provider_proxy import ProviderProxy, host_is_allowed
-from gamedevbench.src.provider_proxy import NonPublicAddressError
-from gamedevbench.src.provider_proxy import _connect_public_host
-from gamedevbench.src.provider_proxy import _parse_client_hello_sni
+from gamedevbench.src.confinement import (
+    ConfinementError,
+    _safe_environment,
+    _secret_environment,
+    build_bwrap_command,
+    provider_hosts_for,
+    run_confined_godot,
+)
+from gamedevbench.src.provider_proxy import (
+    NonPublicAddressError,
+    ProviderProxy,
+    _connect_public_host,
+    _parse_client_hello_sni,
+    host_is_allowed,
+)
 from gamedevbench.src.utils.data_types import ValidationResult
+
+
+@pytest.fixture(scope="session")
+def bwrap_available():
+    if platform.system() != "Linux" or shutil.which("bwrap") is None:
+        pytest.skip("Bubblewrap integration test requires Linux and bwrap")
+    completed = subprocess.run(
+        [
+            "bwrap", "--unshare-all", "--ro-bind", "/", "/",
+            "--proc", "/proc", "/bin/true",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if completed.returncode:
+        pytest.skip(f"Linux namespaces unavailable: {completed.stderr.strip()}")
+
+
+@pytest.fixture(params=["local", "namespace"])
+def proxy_probe(request, monkeypatch, tmp_path):
+    """Run the same HTTP probes locally and inside the production namespace."""
+    confined = request.param == "namespace"
+    if confined:
+        request.getfixturevalue("bwrap_available")
+
+    workspace = tmp_path / "workspace"
+    private_home = tmp_path / "home"
+    output_dir = tmp_path / "output"
+    proxy_dir = tmp_path / "proxy"
+    for directory in (workspace, private_home, output_dir, proxy_dir):
+        directory.mkdir()
+
+    socket_path = proxy_dir / "provider.sock"
+    with ProviderProxy(socket_path, ["api.meta.ai"]) as proxy:
+        relay = None
+        if not confined:
+            relay = provider_proxy._ThreadingTcpServer(
+                ("127.0.0.1", 0), provider_proxy._UnixRelayHandler
+            )
+            relay.unix_socket_path = str(socket_path)
+            monkeypatch.setattr(confinement, "PROXY_PORT", relay.server_address[1])
+            thread = threading.Thread(target=relay.serve_forever, daemon=True)
+            thread.start()
+
+        def run_probe(probe):
+            command = [sys.executable, "-c", probe]
+            environment = _safe_environment()
+            if confined:
+                command = build_bwrap_command(
+                    agent="muse",
+                    workspace=workspace,
+                    private_home=private_home,
+                    output_dir=output_dir,
+                    proxy_dir=proxy_dir,
+                    worker_config=output_dir / "config.json",
+                    worker_output=output_dir / "result.json",
+                    use_private_display=False,
+                    # These probes do not run Godot; satisfy its required mount.
+                    godot_path="/usr/bin/python3",
+                    inner_command=command,
+                )
+                environment = None  # Bubblewrap installs the safe environment.
+            completed = subprocess.run(
+                command,
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stderr
+            return json.loads(completed.stdout.strip().splitlines()[-1])
+
+        try:
+            yield run_probe, proxy
+        finally:
+            if relay is not None:
+                relay.shutdown()
+                relay.server_close()
+                thread.join(timeout=5)
+
+
+@contextmanager
+def serve_http(host, tls_context=None):
+    class Server(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if host == "::1" else socket.AF_INET
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"test-origin")
+
+        def log_message(self, format, *args):
+            pass
+
+    try:
+        server = Server((host, 0), Handler)
+    except OSError as error:
+        if host == "::1" and error.errno in (
+            errno.EAFNOSUPPORT,
+            errno.EADDRNOTAVAIL,
+            errno.EPROTONOSUPPORT,
+        ):
+            pytest.skip(f"IPv6 loopback unavailable: {error}")
+        raise
+    with server:
+        if tls_context is not None:
+            server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1"])
+def test_loopback_http_post_bypasses_provider_proxy(proxy_probe, host):
+    run_probe, proxy = proxy_probe
+    bind_host = "127.0.0.1" if host == "localhost" else host
+    url_host = "[::1]" if host == "::1" else host
+    result = run_probe(f"""
+import errno, httpx, json, socket, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6 if {host!r} == "::1" else socket.AF_INET
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.server.requests.append([self.path, body.decode()])
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"namespace-service")
+
+    def log_message(self, format, *args):
+        pass
+
+try:
+    server = Server(({bind_host!r}, 0), Handler)
+except OSError as error:
+    if {host!r} == "::1" and error.errno in (
+        errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT
+    ):
+        print(json.dumps({{"skip": f"IPv6 loopback unavailable: {{error}}"}}))
+        raise SystemExit(0)
+    raise
+
+with server:
+    server.requests = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with httpx.Client(timeout=3) as client:
+            response = client.post(
+                "http://{url_host}:" + str(server.server_port) + "/mcp",
+                content=b"loopback-probe",
+            )
+        print(json.dumps({{
+            "status": response.status_code,
+            "body": response.text,
+            "requests": server.requests,
+        }}))
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+""")
+    if "skip" in result:
+        pytest.skip(result["skip"])
+    assert proxy.audit.to_dict() == {"allowed_connects": [], "denied_connects": []}
+    assert result == {
+        "status": 200,
+        "body": "namespace-service",
+        "requests": [["/mcp", "loopback-probe"]],
+    }
+
+
+def test_allowed_https_still_uses_provider_proxy(proxy_probe, monkeypatch, tmp_path):
+    run_probe, proxy = proxy_probe
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("Local HTTPS provider fixture requires openssl")
+    certificate = tmp_path / "workspace" / "provider.pem"
+    private_key = tmp_path / "provider-key.pem"
+    subprocess.run(
+        [
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(private_key), "-out", str(certificate), "-days", "1",
+            "-subj", "/CN=api.meta.ai", "-addext", "subjectAltName=DNS:api.meta.ai",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, private_key)
+    with serve_http("127.0.0.1", context) as server:
+        def connect_provider(host, port, timeout):
+            assert (host, port) == ("api.meta.ai", 443)
+            return socket.create_connection(server.server_address, timeout=timeout)
+
+        # Only the upstream destination is replaced. CONNECT, SNI validation,
+        # TLS, HTTP, and proxy audit all run through their real implementations.
+        monkeypatch.setattr(provider_proxy, "_connect_public_host", connect_provider)
+        result = run_probe("""
+import httpx, json, ssl
+
+context = ssl.create_default_context(cafile="provider.pem")
+with httpx.Client(verify=context, timeout=3) as client:
+    response = client.get("https://api.meta.ai/proxy-proof")
+print(json.dumps({"status": response.status_code, "body": response.text}))
+""")
+
+    assert result == {"status": 200, "body": "test-origin"}
+    assert proxy.audit.to_dict() == {
+        "allowed_connects": ["api.meta.ai:443"],
+        "denied_connects": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "url, destination, status",
+    [
+        ("https://raw.githubusercontent.com/", "raw.githubusercontent.com:443", 403),
+        ("https://10.0.0.1/", "10.0.0.1:443", 403),
+        ("https://api.meta.ai:8443/", "api.meta.ai:8443", 403),
+        ("http://api.meta.ai/", "invalid-request", 400),
+    ],
+)
+def test_prohibited_http_traffic_is_still_denied(proxy_probe, url, destination, status):
+    run_probe, proxy = proxy_probe
+    result = run_probe(f"""
+import httpx, json
+
+with httpx.Client(timeout=3) as client:
+    try:
+        response = client.get({url!r})
+        result = {{"status": response.status_code}}
+    except httpx.ProxyError as error:
+        result = {{"proxy_error": str(error)}}
+print(json.dumps(result))
+""")
+    if status == 403:
+        assert "403" in result["proxy_error"]
+    else:
+        assert result == {"status": status}
+    assert proxy.audit.to_dict() == {
+        "allowed_connects": [],
+        "denied_connects": [destination],
+    }
+
+
+@pytest.mark.parametrize("proxy_probe", ["namespace"], indirect=True)
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_bwrap_loopback_does_not_expose_host_service(proxy_probe, host):
+    run_probe, proxy = proxy_probe
+    url_host = "[::1]" if host == "::1" else host
+    with serve_http(host) as server:
+        url = f"http://{url_host}:{server.server_port}/host-only"
+        # Establish that the service really is reachable in the host namespace.
+        with httpx.Client(trust_env=False, timeout=3) as client:
+            assert client.get(url).text == "test-origin"
+        result = run_probe(f"""
+import httpx, json
+
+with httpx.Client(timeout=3) as client:
+    try:
+        response = client.get({url!r})
+        result = {{"status": response.status_code, "body": response.text}}
+    except httpx.ConnectError:
+        result = {{"host_service": "unreachable"}}
+print(json.dumps(result))
+""")
+    assert result == {"host_service": "unreachable"}
+    assert proxy.audit.to_dict() == {"allowed_connects": [], "denied_connects": []}
 
 
 def test_provider_suffix_matching_does_not_allow_lookalikes():
@@ -70,6 +363,17 @@ def test_secret_environment_is_not_placed_in_bubblewrap_arguments(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "canary-secret-must-not-enter-argv")
     assert "OPENAI_API_KEY" not in _safe_environment()
     assert "canary-secret-must-not-enter-argv" not in _safe_environment().values()
+
+
+def test_safe_environment_limits_bypass_and_preserves_proxy_variables():
+    environment = _safe_environment()
+    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
+    assert environment["no_proxy"] == environment["NO_PROXY"]
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        assert environment[key] == f"http://127.0.0.1:{confinement.PROXY_PORT}"
 
 
 def test_custom_codex_provider_does_not_receive_unrelated_openai_key(
@@ -133,20 +437,17 @@ def test_tls_client_hello_sni_cannot_front_another_domain():
     platform.system() != "Linux" or shutil.which("bwrap") is None,
     reason="Bubblewrap integration test requires Linux",
 )
-def test_bwrap_hides_ground_truth_siblings_and_public_network(tmp_path):
+@pytest.mark.parametrize("proxy_probe", ["namespace"], indirect=True)
+def test_bwrap_hides_ground_truth_siblings_and_public_network(proxy_probe, tmp_path):
+    run_probe, proxy = proxy_probe
     workspace = tmp_path / "workspace"
-    private_home = tmp_path / "home"
-    output_dir = tmp_path / "output"
-    proxy_dir = tmp_path / "proxy"
-    for directory in (workspace, private_home, output_dir, proxy_dir):
-        directory.mkdir()
     (workspace / "visible.txt").write_text("workspace-only", encoding="utf-8")
     forbidden_tmp = tmp_path / "forbidden.txt"
     forbidden_tmp.write_text("secret", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     probe = f"""
-import json, socket
+import httpx, json, os, socket
 from pathlib import Path
 
 result = {{
@@ -155,6 +456,8 @@ result = {{
     'source_tasks_visible': Path({str(project_root / 'tasks')!r}).exists(),
     'sibling_tmp_visible': Path({str(forbidden_tmp)!r}).exists(),
     'host_ssh_visible': Path('/home/waynechi/.ssh').exists(),
+    'hosts': Path('/etc/hosts').read_text(),
+    'hosts_writable': os.access('/etc/hosts', os.W_OK),
 }}
 direct = socket.socket()
 direct.settimeout(1)
@@ -166,46 +469,28 @@ except OSError:
 finally:
     direct.close()
 
-proxy = socket.create_connection(('127.0.0.1', 3128), timeout=2)
-proxy.sendall(b'CONNECT raw.githubusercontent.com:443 HTTP/1.1\\r\\n\\r\\n')
-result['github_proxy'] = proxy.recv(1024).decode('ascii').split()[1]
-proxy.close()
+with httpx.Client(timeout=3) as client:
+    try:
+        client.get('https://raw.githubusercontent.com/')
+        result['github_proxy'] = 'connected'
+    except httpx.ProxyError as error:
+        result['github_proxy'] = str(error)
 print(json.dumps(result))
 """
 
-    proxy_socket = proxy_dir / "provider.sock"
-    with ProviderProxy(proxy_socket, ["meta.ai"]) as provider_proxy:
-        command = build_bwrap_command(
-            agent="muse",
-            workspace=workspace,
-            private_home=private_home,
-            output_dir=output_dir,
-            proxy_dir=proxy_dir,
-            worker_config=output_dir / "config.json",
-            worker_output=output_dir / "result.json",
-            use_private_display=False,
-            godot_path="godot",
-            inner_command=["/usr/bin/python3", "-c", probe],
-        )
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
-
-    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    result = run_probe(probe)
+    assert "403" in result.pop("github_proxy")
     assert result == {
         "workspace": "workspace-only",
         "ground_truth_visible": False,
         "source_tasks_visible": False,
         "sibling_tmp_visible": False,
         "host_ssh_visible": False,
+        "hosts": "127.0.0.1 localhost\n::1 localhost\n",
+        "hosts_writable": False,
         "direct_network": "blocked",
-        "github_proxy": "403",
     }
-    assert provider_proxy.audit.denied == ["raw.githubusercontent.com:443"]
+    assert proxy.audit.denied == ["raw.githubusercontent.com:443"]
 
 
 @pytest.mark.skipif(
@@ -214,6 +499,7 @@ print(json.dumps(result))
     or shutil.which("godot") is None,
     reason="Confined Godot integration test requires Linux, Bubblewrap, and Godot",
 )
+@pytest.mark.usefixtures("bwrap_available")
 def test_validation_godot_has_no_host_files_credentials_or_network(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

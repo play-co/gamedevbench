@@ -141,6 +141,11 @@ also run in fresh, credential-free Bubblewrap namespaces with no network route.
 The solver namespace has no direct network route. HTTPS is tunneled through a
 host proxy that permits only selected provider API endpoints, rejects private
 IP resolution, and requires TLS SNI to match the requested endpoint.
+Inside the namespace, `NO_PROXY` and `no_proxy` are fixed to
+`localhost,127.0.0.1,::1` so local tool servers can receive HTTP directly.
+A private, read-only `/etc/hosts` supplies only the two loopback mappings.
+Loopback refers to the solver namespace, not the host. All other destinations
+still use the CONNECT-only provider proxy or fail without a direct network route.
 Muse also runs shell commands with `--sandbox-network restricted` and disables
 web tools. Additional provider domains must be explicitly supplied with
 `--provider-host` and are recorded in result metadata. For `claude-code`,
