@@ -43,6 +43,7 @@ DEFAULT_PROVIDER_HOSTS = {
     "mini-swe": ("api.anthropic.com", "api.openai.com"),
     "opencode": ("openrouter.ai",),
     "openhands": ("api.openai.com",),
+    "playbot": ("api.openai.com",),
 }
 
 # General solver web access remains fail-closed except for official Godot 4.4
@@ -223,6 +224,10 @@ def _safe_environment() -> Dict[str, str]:
         "OR_SITE_URL",
         "OR_APP_NAME",
         "OPENROUTER_API_BASE",
+        "ELECTRON_DISABLE_SANDBOX",
+        "PLAYBOT_DISABLE_TELEMETRY",
+        "PLAYBOT_GODOT_IGNORE_MIN_VERSION",
+        "PLAYBOT_MODEL_CATALOG",
     )
     environment = {
         key: os.environ[key]
@@ -291,6 +296,8 @@ def _secret_environment(agent: str, model: Optional[str]) -> Dict[str, str]:
             if model_lower in {"gpt", "openai"} or model_lower.startswith("gpt")
             else ("ANTHROPIC_API_KEY",)
         )
+    elif agent == "playbot":
+        keys = ("PLAYBOT_OPENAI_API_KEY", "OPENAI_API_KEY")
     elif agent in {"opencode", "openhands"}:
         if "anthropic" in model_lower or "claude" in model_lower:
             keys = ("ANTHROPIC_API_KEY",)
@@ -480,6 +487,11 @@ def build_bwrap_command(
     for name in sorted(tool_names):
         source = local_bin / name
         _add_bind(command, "--ro-bind", source, str(source))
+
+    if agent == "codex":
+        _add_bind(command, "--ro-bind", Path("/opt/codex"), "/opt/codex")
+    elif agent == "playbot":
+        command.extend(["--ro-bind", "/opt/playbot", "/opt/playbot"])
 
     # Claude's launcher in ~/.local/bin is a symlink into this version store.
     claude_store = Path.home() / ".local" / "share" / "claude"
@@ -724,6 +736,13 @@ class ConfinedSolverRun:
     metadata: dict
 
 
+def _solver_needs_private_display(
+    agent: str, use_runtime_video: bool, use_mcp: bool
+) -> bool:
+    """Playbot's Electron process needs X11 even when the task itself does not."""
+    return agent == "playbot" or use_runtime_video or use_mcp
+
+
 def run_confined_solver(
     *,
     workspace: Path,
@@ -783,7 +802,9 @@ def run_confined_solver(
             proxy_dir=proxy_dir,
             worker_config=worker_config,
             worker_output=worker_output,
-            use_private_display=use_runtime_video or use_mcp,
+            use_private_display=_solver_needs_private_display(
+                agent, use_runtime_video, use_mcp
+            ),
             godot_path=godot_path,
         )
         outer_timeout = timeout_seconds + 120 if timeout_seconds else None
@@ -824,7 +845,9 @@ def run_confined_solver(
             "bubblewrap_version": bwrap_version,
             "private_tmp": True,
             "private_home": True,
-            "private_display": bool(use_runtime_video or use_mcp),
+            "private_display": _solver_needs_private_display(
+                agent, use_runtime_video, use_mcp
+            ),
             **proxy.audit.to_dict(),
         }
         return ConfinedSolverRun(
