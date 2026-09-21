@@ -12,6 +12,7 @@ import pytest
 from gamedevbench.src import benchmark_runner
 from gamedevbench.src.benchmark_runner import GodotBenchmarkRunner
 from gamedevbench.src.confinement import ConfinementError
+from gamedevbench.src.confinement import _solver_needs_private_display
 from gamedevbench.src.confinement import _safe_environment
 from gamedevbench.src.confinement import _secret_environment
 from gamedevbench.src.confinement import build_bwrap_command
@@ -104,6 +105,13 @@ def test_playbot_confinement_forwards_only_openai_credentials(monkeypatch):
     assert _secret_environment("playbot", "gpt-5.6-sol") == {
         "OPENAI_API_KEY": "openai-test-key"
     }
+
+
+def test_playbot_solver_always_needs_a_private_display():
+    assert _solver_needs_private_display("playbot", False, False)
+    assert not _solver_needs_private_display("codex", False, False)
+    assert _solver_needs_private_display("codex", True, False)
+    assert _solver_needs_private_display("codex", False, True)
 
 
 def test_secret_environment_is_not_placed_in_bubblewrap_arguments(monkeypatch):

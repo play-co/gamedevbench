@@ -20,7 +20,7 @@ def test_factory_passes_effort_to_supported_solvers():
         assert openhands.effort == "medium"
         expected.append("openhands")
 
-    # Registered by bench-batch's playbot-solver patch; sorts last.
+    # Playbot supports effort and sorts last.
     playbot = SolverFactory.create_solver("playbot", effort="high")
     assert playbot.effort == "high"
     expected.append("playbot")

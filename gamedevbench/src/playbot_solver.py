@@ -231,8 +231,11 @@ class PlaybotSolver(BaseSolver):
         cmd = shlex.split(os.environ.get("PLAYBOT_CMD") or PLAYBOT_EXECUTABLE)
         if PLAYBOT_CLI_MARKER not in cmd:
             cmd.append(PLAYBOT_CLI_MARKER)
+        cmd.append("run")
+        model_catalog = os.environ.get("PLAYBOT_MODEL_CATALOG")
+        if model_catalog:
+            cmd += ["--model-catalog", model_catalog]
         cmd += [
-            "run",
             "-C", os.getcwd(),
             "--model", self.model,
             "--sandbox", "danger-full-access",
@@ -360,12 +363,16 @@ class PlaybotSolver(BaseSolver):
 
         status = result_data.get("status", "failed")
         reported_success = bool(result_data.get("success", False))
-        success = reported_success
+        success = reported_success and status == "completed"
         error = result_data.get("error") or {}
         error_message = error.get("message", "")
         artifact_error = result_data.get("artifact_error") or {}
 
         notes = []
+        if reported_success and status != "completed":
+            notes.append(f"success=true disagrees with status {status!r}")
+        elif not reported_success and status == "completed":
+            notes.append("success=false disagrees with status 'completed'")
         if artifact_error:
             # A run whose trajectory did not survive is not a usable result,
             # whatever the turn itself reported.

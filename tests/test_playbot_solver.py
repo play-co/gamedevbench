@@ -101,7 +101,12 @@ def run_solver(monkeypatch, solver, process, result=None, transcript=None):
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for name in ("PLAYBOT_CMD", "PLAYBOT_OPENAI_API_KEY", "OPENAI_API_KEY"):
+    for name in (
+        "PLAYBOT_CMD",
+        "PLAYBOT_MODEL_CATALOG",
+        "PLAYBOT_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -114,10 +119,21 @@ def test_command_carries_one_cli_marker_and_no_cleanup(monkeypatch, clean_env):
     assert cmd.count(PLAYBOT_CLI_MARKER) == 1
     # The marker only selects CLI mode when `run` is the argument right after it.
     assert cmd[cmd.index(PLAYBOT_CLI_MARKER) + 1] == "run"
+    assert "--model-catalog" not in cmd
     assert "--cleanup" not in cmd
     assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
     assert cmd[cmd.index("--timeout-seconds") + 1] == "30"
     assert cmd[-1] == "test prompt"
+
+
+def test_optional_model_catalog_is_passed_through(monkeypatch, clean_env):
+    monkeypatch.setenv("PLAYBOT_MODEL_CATALOG", "/opt/playbot/additional-models.json")
+    _, captured = run_solver(
+        monkeypatch, PlaybotSolver(timeout_seconds=30), FakeProcess(), result=SUCCESS_RESULT
+    )
+    cmd = captured["cmd"]
+
+    assert cmd[cmd.index("--model-catalog") + 1] == "/opt/playbot/additional-models.json"
 
 
 def test_default_executable_is_the_direct_application_binary(monkeypatch, clean_env):
@@ -191,6 +207,20 @@ def test_schema_v2_success_is_mapped_onto_the_solver_result(monkeypatch, clean_e
     assert result.cost_usd > 0
     assert "exit_code=0" in result.stderr
     assert "playbot_version=0.90.0" in result.stderr
+
+
+def test_non_completed_status_cannot_report_success(monkeypatch, clean_env):
+    inconsistent = {
+        **SUCCESS_RESULT,
+        "status": "infra_error",
+        "success": True,
+    }
+    result, _ = run_solver(
+        monkeypatch, PlaybotSolver(timeout_seconds=30), FakeProcess(), result=inconsistent
+    )
+
+    assert result.success is False
+    assert "success=true disagrees with status 'infra_error'" in result.message
 
 
 def test_structured_rate_limit_is_reported(monkeypatch, clean_env):

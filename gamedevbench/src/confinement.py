@@ -227,6 +227,7 @@ def _safe_environment() -> Dict[str, str]:
         "ELECTRON_DISABLE_SANDBOX",
         "PLAYBOT_DISABLE_TELEMETRY",
         "PLAYBOT_GODOT_IGNORE_MIN_VERSION",
+        "PLAYBOT_MODEL_CATALOG",
     )
     environment = {
         key: os.environ[key]
@@ -727,6 +728,13 @@ class ConfinedSolverRun:
     metadata: dict
 
 
+def _solver_needs_private_display(
+    agent: str, use_runtime_video: bool, use_mcp: bool
+) -> bool:
+    """Playbot's Electron process needs X11 even when the task itself does not."""
+    return agent == "playbot" or use_runtime_video or use_mcp
+
+
 def run_confined_solver(
     *,
     workspace: Path,
@@ -786,7 +794,9 @@ def run_confined_solver(
             proxy_dir=proxy_dir,
             worker_config=worker_config,
             worker_output=worker_output,
-            use_private_display=use_runtime_video or use_mcp,
+            use_private_display=_solver_needs_private_display(
+                agent, use_runtime_video, use_mcp
+            ),
             godot_path=godot_path,
         )
         outer_timeout = timeout_seconds + 120 if timeout_seconds else None
@@ -827,7 +837,9 @@ def run_confined_solver(
             "bubblewrap_version": bwrap_version,
             "private_tmp": True,
             "private_home": True,
-            "private_display": bool(use_runtime_video or use_mcp),
+            "private_display": _solver_needs_private_display(
+                agent, use_runtime_video, use_mcp
+            ),
             **proxy.audit.to_dict(),
         }
         return ConfinedSolverRun(
