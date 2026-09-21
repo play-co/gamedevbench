@@ -66,6 +66,46 @@ def test_claude_code_gateway_base_url_must_be_https_port_443(monkeypatch):
         provider_hosts_for("claude-code", None)
 
 
+def test_codex_catalog_is_mounted_when_installed(tmp_path):
+    catalog_dir = Path("/opt/codex")
+    if not catalog_dir.is_dir():
+        pytest.skip("Runner-specific Codex catalog is not installed")
+
+    workspace = tmp_path / "workspace"
+    private_home = tmp_path / "home"
+    output_dir = tmp_path / "output"
+    proxy_dir = tmp_path / "proxy"
+    for directory in (workspace, private_home, output_dir, proxy_dir):
+        directory.mkdir()
+
+    command = build_bwrap_command(
+        agent="codex",
+        workspace=workspace,
+        private_home=private_home,
+        output_dir=output_dir,
+        proxy_dir=proxy_dir,
+        worker_config=output_dir / "config.json",
+        worker_output=output_dir / "result.json",
+        use_private_display=False,
+        godot_path="godot",
+        inner_command=["/usr/bin/true"],
+    )
+    assert ["--ro-bind", "/opt/codex", "/opt/codex"] == command[
+        command.index("/opt/codex") - 1 : command.index("/opt/codex") + 2
+    ]
+
+
+def test_playbot_confinement_forwards_only_openai_credentials(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+
+    hosts = provider_hosts_for("playbot", "gpt-5.6-sol")
+    assert hosts == ("api.openai.com", "docs.godotengine.org")
+    assert _secret_environment("playbot", "gpt-5.6-sol") == {
+        "OPENAI_API_KEY": "openai-test-key"
+    }
+
+
 def test_secret_environment_is_not_placed_in_bubblewrap_arguments(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "canary-secret-must-not-enter-argv")
     assert "OPENAI_API_KEY" not in _safe_environment()
