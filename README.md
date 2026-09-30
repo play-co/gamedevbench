@@ -34,6 +34,8 @@
 
 The official ICML 2026 camera-ready results are available in [`results/`](results/). Select the leaderboard to view the full results on the project website.
 
+**New: GPT 6 Astra (High)** passes **229/333 tasks (68.8%)** using Codex with runtime-video and strict confinement. [Aggregate results and run details](results/gpt6_astra_codex_runtime_video_high_full_333/).
+
 <p align="center">
   <a href="https://waynechi.com/gamedevbench#leaderboard">
     <img src="assets/leaderboard.png" alt="GameDevBench leaderboard" width="95%">
@@ -60,7 +62,7 @@ GameDevBench contains **333 game development tasks** to evaluate LLM agents' abi
 
 ### Prerequisites
 
-- **Godot 4.4.1 (exact)** — Download the [4.4.1 stable release](https://godotengine.org/download/archive/4.4.1-stable/). Official validation and leaderboard runs require this version. Ensure it is available as `godot`, or set `GODOT_EXEC_PATH` to the 4.4.1 executable; the CLI rejects other versions before running tasks.
+- **Godot 4.4.1 (exact)** — Download the [4.4.1 stable release](https://godotengine.org/download/archive/4.4.1-stable/). Official validation and leaderboard runs require this version. Ensure it is available as `godot`, or set `GODOT_EXEC_PATH` to the 4.4.1 executable; the CLI rejects other versions before running tasks. Set `GODOT_ALLOW_NEWER=1` to experiment with a newer release; such results are not comparable to the leaderboard.
 - **Python 3.10+** (Python 3.12+ for OpenHands)
 
 ### Install an Agent

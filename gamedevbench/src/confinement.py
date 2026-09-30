@@ -218,6 +218,19 @@ priority = 999
     )
 
 
+def _software_rendering_environment() -> Dict[str, str]:
+    """Select software graphics drivers for namespaces without GPU devices."""
+    environment = {
+        "LIBGL_ALWAYS_SOFTWARE": "1",
+        "__GLX_VENDOR_LIBRARY_NAME": "mesa",
+    }
+    mesa_egl = Path("/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+    if mesa_egl.is_file():
+        # Loading the host NVIDIA EGL driver without its devices can crash Xvfb.
+        environment["__EGL_VENDOR_LIBRARY_FILENAMES"] = str(mesa_egl)
+    return environment
+
+
 def _safe_environment() -> Dict[str, str]:
     """Construct a small environment without unrelated host credentials."""
     allowed_variables = (
@@ -263,6 +276,7 @@ def _safe_environment() -> Dict[str, str]:
             "no_proxy": "localhost,127.0.0.1,::1",
         }
     )
+    environment.update(_software_rendering_environment())
     return environment
 
 
@@ -664,6 +678,7 @@ def build_validation_bwrap_command(
         "GAMEDEVBENCH_CONFINED": "1",
         "GAMEDEVBENCH_TOOL_NETWORK": "none",
     }
+    environment.update(_software_rendering_environment())
     for key, value in environment.items():
         command.extend(["--setenv", key, value])
 

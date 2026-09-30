@@ -220,6 +220,11 @@ class ProxyAudit:
 
 def _relay_bidirectional(left: socket.socket, right: socket.socket) -> None:
     """Relay bytes until either side closes."""
+    # CONNECT and TLS handshakes have short deadlines, but model streams can
+    # legitimately be idle while reasoning. The solver owns the run timeout.
+    left.settimeout(None)
+    right.settimeout(None)
+
     def pump(source: socket.socket, destination: socket.socket) -> None:
         try:
             while True:
