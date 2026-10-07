@@ -104,6 +104,7 @@ class ClaudeCodeSolver(BaseSolver):
                 system_prompt=create_system_prompt(self.use_mcp),
                 permission_mode="bypassPermissions",
                 cwd=os.getcwd(),
+                max_buffer_size=32 * 1024 * 1024,
             )
 
             if os.environ.get("GAMEDEVBENCH_CONFINED") == "1":
